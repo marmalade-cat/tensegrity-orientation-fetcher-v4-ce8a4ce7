@@ -1,0 +1,115 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Tensegrity Orientation Fetcher V4 (prototype)</title>
+<style>
+body{font-family:system-ui,Segoe UI,Arial;max-width:900px;margin:20px auto;color:#222}
+textarea,input,button{font:inherit}
+textarea{width:100%;height:80px}
+.result{white-space:pre-wrap;background:#f6f6f8;padding:10px;border-radius:6px;border:1px solid #ddd}
+.row{display:flex;gap:8px}
+.col{flex:1}
+.small{font-size:0.9em;color:#555}
+</style>
+</head>
+<body>
+<h2>Tensegrity Orientation Fetcher V4 — prototype</h2>
+<p class="small">I am Marmalade, a museum cat with a notebook. Paste file URLs (CSV/JSON/ZIP) below. This client-side demo fetches them, looks for orientation-like fields, normalizes records, and gives a downloadable report with provenance metadata.</p>
+<label>One URL per line (CORS required for remote URLs):</label>
+<textarea id="urls" placeholder="https://example.org/data1.csv
+https://example.org/data2.json"></textarea>
+<div class="row" style="margin-top:8px">
+<button id="run">Fetch and Parse</button>
+<button id="clear">Clear</button>
+<div style="margin-left:auto"><button id="download">Download Report</button></div>
+</div>
+<h3>Log</h3>
+<div id="log" class="result">Idle.</div>
+<script>
+// Minimal heuristics to find orientation-like fields
+const ORIENT_KEYS = ['x','y','z','roll','pitch','yaw','qx','qy','qz','qw','quat','orientation','azimuth','elevation'];
+
+function log(msg){const el=document.getElementById('log'); el.textContent += '\n'+msg; el.scrollTop = el.scrollHeight}
+
+async function fetchText(url){const res=await fetch(url); if(!res.ok) throw new Error('HTTP '+res.status); const ct=res.headers.get('content-type')||''; const blob=await res.blob(); return {blob,contentType:ct};}
+
+function isCSV(text){ // naive
+ return /,/.test(text) && /\n/.test(text);
+}
+
+function parseCSV(text){const lines=text.split(/\r?\n/).filter(l=>l.trim().length>0); const hdr=lines[0].split(/,\s*/).map(h=>h.trim()); const rows=lines.slice(1).map(l=>{
+ const cols=l.split(/,\s*/);
+ const obj={}; hdr.forEach((h,i)=>obj[h]=cols[i]===undefined? null: cols[i]); return obj;
+}); return {header:hdr,rows};}
+
+function detectFields(obj){const keys=Object.keys(obj); const found=[]; for(const k of keys){const kl=k.toLowerCase(); for(const t of ORIENT_KEYS){if(kl.includes(t)) {found.push(k); break}}} return found;}
+
+function normalizeRecord(rec, foundKeys){ // attempt: map detected groups to standard names
+ const out={}; // we'll try to produce x,y,z,roll,pitch,yaw or quaternion
+ for(const k of foundKeys){const lk=k.toLowerCase(); const v=rec[k]; if(lk==='x' || lk.endsWith('_x') || lk.includes('posx')) out.x=parseFloat(v);
+ else if(lk==='y' || lk.endsWith('_y') || lk.includes('posy')) out.y=parseFloat(v);
+ else if(lk==='z' || lk.endsWith('_z') || lk.includes('posz')) out.z=parseFloat(v);
+ else if(lk.includes('roll')) out.roll=parseFloat(v);
+ else if(lk.includes('pitch')) out.pitch=parseFloat(v);
+ else if(lk.includes('yaw')) out.yaw=parseFloat(v);
+ else if(lk==='qx' || lk.includes('quatx')) out.qx=parseFloat(v);
+ else if(lk==='qy' || lk.includes('quaty')) out.qy=parseFloat(v);
+ else if(lk==='qz' || lk.includes('quatz')) out.qz=parseFloat(v);
+ else if(lk==='qw' || lk.includes('quatw')) out.qw=parseFloat(v);
+ }
+ return out;
+}
+
+async function processURL(url, report){ log('Fetching: '+url);
+ try{
+ const {blob,contentType} = await fetchText(url);
+ const name = url.split('/').pop().split('?')[0];
+ if(contentType.includes('application/json') || name.endsWith('.json')){
+ const text = await blob.text(); const data = JSON.parse(text);
+ // support array of objects or object with key
+ let rows = Array.isArray(data)? data : (Array.isArray(data.data)? data.data : [data]);
+ for(const r of rows){ const found=detectFields(r); const normalized=normalizeRecord(r, found); report.entries.push({source:url,filename:name,originalFields:Object.keys(r),detectedFields:found,normalized}); }
+ log('Parsed JSON: '+name+' ('+rows.length+' rows)');
+ }
+ else if(contentType.includes('text/csv') || name.endsWith('.csv') || contentType.includes('application/vnd.ms-excel') ){
+ const text = await blob.text(); if(!isCSV(text)){ log('Warning: CSV heuristic failed for '+name); }
+ const {header,rows} = parseCSV(text);
+ for(const r of rows){ const found=detectFields(r); const normalized=normalizeRecord(r, found); report.entries.push({source:url,filename:name,originalFields:header,detectedFields:found,normalized}); }
+ log('Parsed CSV: '+name+' ('+rows.length+' rows)');
+ }
+ else if(name.endsWith('.zip')){
+ log('ZIP detected: '+name+' — browser ZIP parsing not implemented in this prototype.');
+ report.entries.push({source:url,filename:name,note:'ZIP skipped in prototype'});
+ }
+ else {
+ // try text
+ const text = await blob.text(); if(isCSV(text)){ const {header,rows}=parseCSV(text); for(const r of rows){ const found=detectFields(r); report.entries.push({source:url,filename:name,originalFields:header,detectedFields:found,normalized:normalizeRecord(r,found)}); } log('Parsed text-as-CSV: '+name+' ('+rows.length+' rows)'); }
+ else { log('Unknown type for '+name+' (content-type: '+contentType+') — skipped'); report.entries.push({source:url,filename:name,note:'unknown type',contentType}); }
+ }
+ }catch(e){ log('Error fetching '+url+': '+e.message); report.entries.push({source:url,error:e.message}); }
+}
+
+document.getElementById('run').addEventListener('click', async ()=>{
+ document.getElementById('log').textContent='Starting...';
+ const raw = document.getElementById('urls').value.split('\n').map(s=>s.trim()).filter(Boolean);
+ if(raw.length===0){ log('No URLs provided.'); return; }
+ const report = {generatedAt: (new Date()).toISOString(),agent:'TensegrityOrientationFetcherV4-prototype',entries:[]};
+ for(const u of raw){ await processURL(u,report); }
+ // summarize
+ const counts = {parsed:0,skipped:0}; for(const e of report.entries){ if(e.normalized) counts.parsed++; else counts.skipped++; }
+ log('\nReport: '+JSON.stringify({generatedAt:report.generatedAt,totalEntries:report.entries.length,parsed:counts.parsed,skipped:counts.skipped}));
+ // store last report
+ window._lastReport = report;
+});
+
+document.getElementById('clear').addEventListener('click', ()=>{ document.getElementById('urls').value=''; document.getElementById('log').textContent='Cleared.'; window._lastReport=null; });
+
+document.getElementById('download').addEventListener('click', ()=>{
+ const rep = window._lastReport; if(!rep){ alert('No report: run first.'); return; }
+ const blob = new Blob([JSON.stringify(rep,null,2)],{type:'application/json'});
+ const url = URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='orientation_report.json'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+});
+</script>
+</body>
+</html>
